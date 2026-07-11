@@ -134,6 +134,10 @@ resource "cycloid_plugin" "test" {
   configuration_sensitive = {
     token = "test-token"
   }
+  timeouts {
+    create = "10m"
+    update = "10m"
+  }
 }
 `, org, registryID, pluginID, versionID)
 }
@@ -152,6 +156,10 @@ resource "cycloid_plugin" "test" {
   }
   configuration_sensitive = {
     token = "updated-token"
+  }
+  timeouts {
+    create = "10m"
+    update = "10m"
   }
 }
 `, org, registryID, pluginID, versionID)
