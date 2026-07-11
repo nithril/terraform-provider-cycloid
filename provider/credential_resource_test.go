@@ -7,11 +7,15 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/cycloidio/cycloid-cli/client/models"
+	fwresource "github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -65,6 +69,58 @@ func TestAccCredentialResource_AWS(t *testing.T) {
 					resource.TestCheckResourceAttr("cycloid_credential.test", "description", credDesc+" updated"),
 					resource.TestCheckResourceAttr("cycloid_credential.test", "type", "aws"),
 					resource.TestCheckResourceAttr("cycloid_credential.test", "path", credName+"-updated"),
+				),
+			},
+			// Destroy testing
+			{
+				Config:  " ", // Empty config to trigger destroy
+				Destroy: true,
+			},
+		},
+	})
+}
+
+// TestAccCredentialResource_CanonicalChangeForcesReplace reproduces the
+// "Provider produced inconsistent result after apply" bug on `.canonical`.
+// Before the RequiresReplaceIfConfigured plan modifier, changing an
+// explicitly-configured canonical was planned as an in-place update that kept
+// the old (state) canonical and wrote it back, mismatching the planned value.
+// The change must now be planned and applied as a replacement instead.
+func TestAccCredentialResource_CanonicalChangeForcesReplace(t *testing.T) {
+	t.Parallel()
+
+	orgCanonical := testAccGetOrganizationCanonical()
+	ctx := context.Background()
+	depManager := NewTestDependencyManager(t)
+	defer depManager.Cleanup(ctx, t)
+
+	name := RandomCanonical("test-cred-canon")
+	canonical1 := RandomCanonical("cred-canon-one")
+	canonical2 := RandomCanonical("cred-canon-two")
+	const desc = "credential canonical replacement test"
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: depManager.GetProviderFactories(),
+		PreCheck:                 func() { testAccPreCheck(t) },
+		Steps: []resource.TestStep{
+			// Create with an explicit canonical.
+			{
+				Config: testAccCredentialConfig_awsWithCanonical(orgCanonical, name, canonical1, desc),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("cycloid_credential.test", "canonical", canonical1),
+				),
+			},
+			// Change the canonical: it must force a replacement, not an in-place
+			// update, and must not error with an inconsistent result.
+			{
+				Config: testAccCredentialConfig_awsWithCanonical(orgCanonical, name, canonical2, desc),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("cycloid_credential.test", plancheck.ResourceActionReplace),
+					},
+				},
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("cycloid_credential.test", "canonical", canonical2),
 				),
 			},
 			// Destroy testing
@@ -387,6 +443,24 @@ resource "cycloid_credential" "test" {
   }
 }
 `, org, name, desc, name)
+}
+
+func testAccCredentialConfig_awsWithCanonical(org, name, canonical, desc string) string {
+	return fmt.Sprintf(`
+resource "cycloid_credential" "test" {
+  organization_canonical = "%s"
+  name                   = "%s"
+  canonical              = "%s"
+  description            = "%s"
+  type                   = "aws"
+  path                   = "%s"
+
+  body = {
+    access_key = "test-access-key"
+    secret_key = "test-secret-key"
+  }
+}
+`, org, name, canonical, desc, canonical)
 }
 
 func testAccCredentialConfig_ssh(org, name, desc, sshKey string) string {
@@ -744,4 +818,35 @@ func TestResolveCredentialUpdateOwner(t *testing.T) {
 			assert.Equal(t, testCase.expected, owner)
 		})
 	}
+}
+
+// TestCredentialSchemaCanonicalForcesReplaceWhenConfigured guards the fix for
+// the "Provider produced inconsistent result after apply" bug on
+// `.canonical`. The Cycloid API cannot cleanly rename a credential canonical
+// (a PUT that changes it renames server-side but responds 404), so a changed,
+// explicitly-configured canonical must force replacement rather than an
+// in-place update. This is enforced by a RequiresReplaceIfConfigured plan
+// modifier added in credentialResource.Schema(). The credential schema is
+// code-generated, so this also protects the post-processing from being lost on
+// regeneration.
+func TestCredentialSchemaCanonicalForcesReplaceWhenConfigured(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	resp := &fwresource.SchemaResponse{}
+	NewCredentialResource().Schema(ctx, fwresource.SchemaRequest{}, resp)
+
+	attr, ok := resp.Schema.Attributes["canonical"].(schema.StringAttribute)
+	if !ok {
+		t.Fatalf("canonical attribute is not a schema.StringAttribute: %T", resp.Schema.Attributes["canonical"])
+	}
+
+	found := false
+	for _, pm := range attr.PlanModifiers {
+		if strings.Contains(pm.Description(ctx), "destroy and recreate") {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "canonical must force replacement when a configured value changes; the API cannot rename a credential canonical in place")
 }
